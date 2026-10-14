@@ -1,6 +1,10 @@
 import os
 import sqlite3
 import hashlib
+import io
+import wave
+import array
+import math
 from datetime import datetime
 import logging
 import streamlit as st
@@ -44,7 +48,6 @@ DB_NAME = "fc_tasks.db"
 
 def get_conn():
     conn = sqlite3.connect(DB_NAME)
-    # Make ON DELETE CASCADE actually work in SQLite
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -161,6 +164,48 @@ class MeetingTaskExtraction(BaseModel):
     tasks: list[Task] = Field(description="Extracted tasks")
 
 
+class NoSpeechError(Exception):
+    """Raised when the recording contains no usable speech."""
+
+
+MIN_DURATION_SEC = 1.0
+MIN_RMS = 150  # 16-bit PCM scale (max 32768)
+
+
+def check_audio_has_sound(audio_data: bytes):
+    """Reject recordings that are too short or essentially silent (WAV only)."""
+    try:
+        with wave.open(io.BytesIO(audio_data), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            width = wf.getsampwidth()
+            raw = wf.readframes(frames)
+    except (wave.Error, EOFError):
+        return  
+
+    if rate and frames / rate < MIN_DURATION_SEC:
+        raise ValueError("Audio recording is too short.")
+
+    if width == 2 and raw:
+        samples = array.array("h")
+        samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+        rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+        if rms < MIN_RMS:
+            raise NoSpeechError("Recording is silent.")
+
+
+PROMPT = """You are a strict transcription and task-extraction assistant.
+
+Rules:
+- Use ONLY what is actually spoken in the audio. Never invent, guess, or fill in content.
+- If the audio is silent, contains only background noise, or has no intelligible speech, return an empty transcript, an empty summary, and an empty tasks list.
+- Only create a task if the speaker clearly states something that needs to be done. Do not infer tasks that were not said.
+- Leave assignee and due_date as null unless they are explicitly mentioned.
+- Keep the original language (Armenian/English). Do not translate.
+
+Return: the exact transcript, a 1-sentence summary, and the extracted tasks."""
+
+
 def process_audio_note(audio_data: bytes, mime_type: str) -> MeetingTaskExtraction:
     if len(audio_data) < 1000:
         raise ValueError("Audio recording is empty or too short.")
@@ -169,19 +214,25 @@ def process_audio_note(audio_data: bytes, mime_type: str) -> MeetingTaskExtracti
         mime_type = "audio/mp3"
     else:
         mime_type = "audio/wav"
+        check_audio_has_sound(audio_data)
 
     response = client.models.generate_content(
-        model="gemini-3.8-flash",  # double-check this name in Google AI Studio
+        model="gemini-flash-latest",  # Updated to avoid capacity limits
         contents=[
             types.Part.from_bytes(data=audio_data, mime_type=mime_type),
-            "Provide a 1-sentence summary and extract all tasks with assignee, due date, and priority. Keep original language (Armenian/English)."
+            PROMPT,
         ],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=MeetingTaskExtraction,
+            temperature=0,
         ),
     )
-    return MeetingTaskExtraction.model_validate_json(response.text)
+    result = MeetingTaskExtraction.model_validate_json(response.text)
+
+    if not result.transcript.strip():
+        raise NoSpeechError("No speech detected.")
+    return result
 
 
 # --- Sidebar: History ---
@@ -211,32 +262,41 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 if "processed_audio_signature" not in st.session_state:
     st.session_state.processed_audio_signature = None
+if "latest_result" not in st.session_state:
+    st.session_state.latest_result = None
 
 audio_recording = st.audio_input("Record briefing", label_visibility="collapsed")
 
 if audio_recording is not None:
-    # Identify the recording by its CONTENT (id() changes on every rerun)
     audio_data = audio_recording.getvalue()
     audio_signature = hashlib.md5(audio_data).hexdigest()
 
     if st.session_state.processed_audio_signature != audio_signature:
-        # Mark as handled BEFORE processing so a failure or rerun can never loop
         st.session_state.processed_audio_signature = audio_signature
         try:
             with st.spinner("🎙️ Analyzing audio and extracting tasks... Please wait a few seconds."):
                 mime_type = getattr(audio_recording, "type", None) or "audio/wav"
                 result = process_audio_note(audio_data, mime_type)
                 save_note_to_db(result)
+                st.session_state.latest_result = {
+                    "signature": audio_signature,
+                    "summary": result.summary,
+                    "tasks": [t.model_dump() for t in result.tasks],
+                }
             st.rerun()
+        except NoSpeechError:
+            st.warning("⚠️ No speech detected in the recording. Nothing was saved.")
         except ValueError:
             st.warning("⚠️ Recording is too short.")
         except Exception as e:
             st.error(f"Error: {e}")
 
-# Display the latest summary and tasks directly below the recorder interface
-history = load_history_from_db()
-if history:
-    latest = history[0]
+latest = st.session_state.latest_result
+if (
+    audio_recording is not None
+    and latest is not None
+    and latest["signature"] == st.session_state.processed_audio_signature
+):
     st.divider()
     st.subheader("📋 Summary")
     st.write(latest['summary'])
