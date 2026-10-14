@@ -5,6 +5,8 @@ import io
 import wave
 import array
 import math
+import re
+import time
 from datetime import datetime
 import logging
 import streamlit as st
@@ -208,6 +210,87 @@ Rules:
 Return: the exact transcript, a 1-sentence summary, and the extracted tasks."""
 
 
+# Models you prefer, tried first (if your key can actually use them)
+PREFERRED_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"]
+RETRIES_PER_MODEL = 2   # attempts on one model before moving to the next
+MAX_MODELS = 4          # never try more than this many models per recording
+
+# Skip models that can't take audio and return text/JSON
+EXCLUDED_KEYWORDS = (
+    "tts", "image", "embedding", "live", "audio", "robotics",
+    "computer-use", "learnlm", "aqa", "imagen", "veo",
+)
+
+
+def model_sort_key(name: str):
+    """Newest version first, then flash > pro > other, 'lite' last."""
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    version = float(m.group(1)) if m else 0.0
+    family = 0 if "flash" in name else 1 if "pro" in name else 2
+    lite = 1 if "lite" in name else 0
+    return (-version, lite, family, name)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def discover_models() -> list[str]:
+    """Ask the Gemini API which models this key can use for generateContent."""
+    try:
+        found = []
+        for m in client.models.list():
+            name = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "generateContent" not in actions:
+                continue
+            if not name.startswith("gemini"):
+                continue
+            if any(k in name for k in EXCLUDED_KEYWORDS):
+                continue
+            found.append(name)
+        return sorted(set(found), key=model_sort_key)
+    except Exception:
+        return []  # listing failed, fall back to the preferred list only
+
+
+def get_candidate_models() -> list[str]:
+    discovered = discover_models()
+    if discovered:
+        preferred = [m for m in PREFERRED_MODELS if m in discovered]
+        rest = [m for m in discovered if m not in preferred]
+        candidates = preferred + rest
+    else:
+        candidates = list(PREFERRED_MODELS)
+    return candidates[:MAX_MODELS]
+
+
+def is_transient_error(e: Exception) -> bool:
+    code = getattr(e, "code", None)
+    if code in (429, 500, 502, 503, 504):
+        return True
+    msg = str(e)
+    return any(s in msg for s in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded"))
+
+
+def generate_with_retry(contents, config):
+    last_error = None
+    for model in get_candidate_models():
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                return client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except Exception as e:
+                last_error = e
+                code = getattr(e, "code", None)
+                if code in (401, 403):
+                    raise  # key/permission problem: other models won't help
+                if is_transient_error(e):
+                    if attempt < RETRIES_PER_MODEL - 1:
+                        time.sleep(2 ** attempt)  # 1s, then move on
+                    continue
+                break  # model-specific problem (unsupported, not found): next model
+    raise last_error
+
+
 def process_audio_note(audio_data: bytes, mime_type: str) -> MeetingTaskExtraction:
     if len(audio_data) < 1000:
         raise ValueError("Audio recording is empty or too short.")
@@ -218,8 +301,7 @@ def process_audio_note(audio_data: bytes, mime_type: str) -> MeetingTaskExtracti
         mime_type = "audio/wav"
         check_audio_has_sound(audio_data)  # skip the API call for silence
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",  # double-check this name in Google AI Studio
+    response = generate_with_retry(
         contents=[
             types.Part.from_bytes(data=audio_data, mime_type=mime_type),
             PROMPT,
@@ -267,6 +349,14 @@ if "processed_audio_signature" not in st.session_state:
     st.session_state.processed_audio_signature = None
 if "latest_result" not in st.session_state:
     st.session_state.latest_result = None
+if "last_failed" not in st.session_state:
+    st.session_state.last_failed = False
+
+
+def retry_processing():
+    # Forget the signature so the same recording is processed again
+    st.session_state.processed_audio_signature = None
+    st.session_state.last_failed = False
 
 audio_recording = st.audio_input("Record briefing", label_visibility="collapsed")
 
@@ -294,7 +384,14 @@ if audio_recording is not None:
         except ValueError:
             st.warning("⚠️ Recording is too short.")
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.session_state.last_failed = True
+            if is_transient_error(e):
+                st.error("⚠️ The AI service is busy right now. Nothing was saved. Please try again in a moment.")
+            else:
+                st.error(f"Error: {e}")
+
+    if st.session_state.last_failed:
+        st.button("🔄 Try again", on_click=retry_processing)
 
 # Show the summary and tasks only for the recording made in this session
 latest = st.session_state.latest_result
