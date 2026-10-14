@@ -1,12 +1,6 @@
 import os
 import sqlite3
 import hashlib
-import io
-import wave
-import array
-import math
-import re
-import time
 from datetime import datetime
 import logging
 import streamlit as st
@@ -167,130 +161,6 @@ class MeetingTaskExtraction(BaseModel):
     tasks: list[Task] = Field(description="Extracted tasks")
 
 
-class NoSpeechError(Exception):
-    """Raised when the recording contains no usable speech."""
-
-
-# Tune these if real quiet speech gets rejected (lower) or noise gets through (raise)
-MIN_DURATION_SEC = 1.0
-MIN_RMS = 150  # 16-bit PCM scale (max 32768)
-
-
-def check_audio_has_sound(audio_data: bytes):
-    """Reject recordings that are too short or essentially silent (WAV only)."""
-    try:
-        with wave.open(io.BytesIO(audio_data), "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            width = wf.getsampwidth()
-            raw = wf.readframes(frames)
-    except (wave.Error, EOFError):
-        return  # not a parsable WAV; rely on the model-side guard instead
-
-    if rate and frames / rate < MIN_DURATION_SEC:
-        raise ValueError("Audio recording is too short.")
-
-    if width == 2 and raw:
-        samples = array.array("h")
-        samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
-        rms = math.sqrt(sum(s * s for s in samples) / len(samples))
-        if rms < MIN_RMS:
-            raise NoSpeechError("Recording is silent.")
-
-
-PROMPT = """You are a strict transcription and task-extraction assistant.
-
-Rules:
-- Use ONLY what is actually spoken in the audio. Never invent, guess, or fill in content.
-- If the audio is silent, contains only background noise, or has no intelligible speech, return an empty transcript, an empty summary, and an empty tasks list.
-- Only create a task if the speaker clearly states something that needs to be done. Do not infer tasks that were not said.
-- Leave assignee and due_date as null unless they are explicitly mentioned.
-- Keep the original language (Armenian/English). Do not translate.
-
-Return: the exact transcript, a 1-sentence summary, and the extracted tasks."""
-
-
-# Models you prefer, tried first (if your key can actually use them)
-PREFERRED_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"]
-RETRIES_PER_MODEL = 2   # attempts on one model before moving to the next
-MAX_MODELS = 4          # never try more than this many models per recording
-
-# Skip models that can't take audio and return text/JSON
-EXCLUDED_KEYWORDS = (
-    "tts", "image", "embedding", "live", "audio", "robotics",
-    "computer-use", "learnlm", "aqa", "imagen", "veo",
-)
-
-
-def model_sort_key(name: str):
-    """Newest version first, then flash > pro > other, 'lite' last."""
-    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
-    version = float(m.group(1)) if m else 0.0
-    family = 0 if "flash" in name else 1 if "pro" in name else 2
-    lite = 1 if "lite" in name else 0
-    return (-version, lite, family, name)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def discover_models() -> list[str]:
-    """Ask the Gemini API which models this key can use for generateContent."""
-    try:
-        found = []
-        for m in client.models.list():
-            name = (m.name or "").replace("models/", "")
-            actions = getattr(m, "supported_actions", None) or []
-            if "generateContent" not in actions:
-                continue
-            if not name.startswith("gemini"):
-                continue
-            if any(k in name for k in EXCLUDED_KEYWORDS):
-                continue
-            found.append(name)
-        return sorted(set(found), key=model_sort_key)
-    except Exception:
-        return []  # listing failed, fall back to the preferred list only
-
-
-def get_candidate_models() -> list[str]:
-    discovered = discover_models()
-    if discovered:
-        preferred = [m for m in PREFERRED_MODELS if m in discovered]
-        rest = [m for m in discovered if m not in preferred]
-        candidates = preferred + rest
-    else:
-        candidates = list(PREFERRED_MODELS)
-    return candidates[:MAX_MODELS]
-
-
-def is_transient_error(e: Exception) -> bool:
-    code = getattr(e, "code", None)
-    if code in (429, 500, 502, 503, 504):
-        return True
-    msg = str(e)
-    return any(s in msg for s in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded"))
-
-
-def generate_with_retry(contents, config):
-    last_error = None
-    for model in get_candidate_models():
-        for attempt in range(RETRIES_PER_MODEL):
-            try:
-                return client.models.generate_content(
-                    model=model, contents=contents, config=config
-                )
-            except Exception as e:
-                last_error = e
-                code = getattr(e, "code", None)
-                if code in (401, 403):
-                    raise  # key/permission problem: other models won't help
-                if is_transient_error(e):
-                    if attempt < RETRIES_PER_MODEL - 1:
-                        time.sleep(2 ** attempt)  # 1s, then move on
-                    continue
-                break  # model-specific problem (unsupported, not found): next model
-    raise last_error
-
-
 def process_audio_note(audio_data: bytes, mime_type: str) -> MeetingTaskExtraction:
     if len(audio_data) < 1000:
         raise ValueError("Audio recording is empty or too short.")
@@ -299,25 +169,19 @@ def process_audio_note(audio_data: bytes, mime_type: str) -> MeetingTaskExtracti
         mime_type = "audio/mp3"
     else:
         mime_type = "audio/wav"
-        check_audio_has_sound(audio_data)  # skip the API call for silence
 
-    response = generate_with_retry(
+    response = client.models.generate_content(
+        model="gemini-3.8-flash",  # double-check this name in Google AI Studio
         contents=[
             types.Part.from_bytes(data=audio_data, mime_type=mime_type),
-            PROMPT,
+            "Provide a 1-sentence summary and extract all tasks with assignee, due date, and priority. Keep original language (Armenian/English)."
         ],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=MeetingTaskExtraction,
-            temperature=0,
         ),
     )
-    result = MeetingTaskExtraction.model_validate_json(response.text)
-
-    # Model-side guard: nothing was actually said
-    if not result.transcript.strip():
-        raise NoSpeechError("No speech detected.")
-    return result
+    return MeetingTaskExtraction.model_validate_json(response.text)
 
 
 # --- Sidebar: History ---
@@ -347,16 +211,6 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 if "processed_audio_signature" not in st.session_state:
     st.session_state.processed_audio_signature = None
-if "latest_result" not in st.session_state:
-    st.session_state.latest_result = None
-if "last_failed" not in st.session_state:
-    st.session_state.last_failed = False
-
-
-def retry_processing():
-    # Forget the signature so the same recording is processed again
-    st.session_state.processed_audio_signature = None
-    st.session_state.last_failed = False
 
 audio_recording = st.audio_input("Record briefing", label_visibility="collapsed")
 
@@ -373,33 +227,16 @@ if audio_recording is not None:
                 mime_type = getattr(audio_recording, "type", None) or "audio/wav"
                 result = process_audio_note(audio_data, mime_type)
                 save_note_to_db(result)
-                st.session_state.latest_result = {
-                    "signature": audio_signature,
-                    "summary": result.summary,
-                    "tasks": [t.model_dump() for t in result.tasks],
-                }
             st.rerun()
-        except NoSpeechError:
-            st.warning("⚠️ No speech detected in the recording. Nothing was saved.")
         except ValueError:
             st.warning("⚠️ Recording is too short.")
         except Exception as e:
-            st.session_state.last_failed = True
-            if is_transient_error(e):
-                st.error("⚠️ The AI service is busy right now. Nothing was saved. Please try again in a moment.")
-            else:
-                st.error(f"Error: {e}")
+            st.error(f"Error: {e}")
 
-    if st.session_state.last_failed:
-        st.button("🔄 Try again", on_click=retry_processing)
-
-# Show the summary and tasks only for the recording made in this session
-latest = st.session_state.latest_result
-if (
-    audio_recording is not None
-    and latest is not None
-    and latest["signature"] == st.session_state.processed_audio_signature
-):
+# Display the latest summary and tasks directly below the recorder interface
+history = load_history_from_db()
+if history:
+    latest = history[0]
     st.divider()
     st.subheader("📋 Summary")
     st.write(latest['summary'])
